@@ -33,6 +33,9 @@ pub struct DynamicTestLinkingPreprocessor;
 /// artifact metadata, import sets, compiler settings, or build records.
 #[derive(serde::Deserialize)]
 struct CompilerCacheFiles {
+    // A map is required to deserialize the cache's object shape while intentionally discarding
+    // values; only its source-unit keys are needed.
+    #[allow(clippy::zero_sized_map_values)]
     files: BTreeMap<PathBuf, serde::de::IgnoredAny>,
 }
 

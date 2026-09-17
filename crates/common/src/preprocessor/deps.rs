@@ -380,6 +380,32 @@ impl<'gcx, 'src> BytecodeDependencyCollector<'gcx, 'src> {
 
         self.dependencies.push(dependency);
     }
+
+    /// Collects an enclosing creation after its children have been visited. Call options are part
+    /// of the enclosing replacement, so a creation with a rewritten option must remain native to
+    /// avoid overlapping source updates.
+    fn collect_enclosing_creation(
+        &mut self,
+        dependency: BytecodeDependency,
+        previous_dependencies: usize,
+        call_options: Option<&CallOptions<'_>>,
+    ) {
+        let options_range =
+            call_options.map(|options| span_to_range(self.gcx.sess.source_map(), options.span));
+        let has_rewritten_option = options_range.is_some_and(|options_range| {
+            self.dependencies[previous_dependencies..].iter().any(|nested| {
+                nested.loc.start < options_range.end && options_range.start < nested.loc.end
+            })
+        });
+        if has_rewritten_option {
+            let force_native = self.force_native;
+            self.force_native = true;
+            self.collect_dependency(dependency);
+            self.force_native = force_native;
+        } else {
+            self.collect_dependency(dependency);
+        }
+    }
 }
 
 /// Returns whether copying a constructor type into a generated source unit preserves its identity.
@@ -485,7 +511,10 @@ impl<'gcx> Visit<'gcx> for BytecodeDependencyCollector<'gcx, '_> {
                     call_args,
                     named_args,
                 ) {
-                    self.collect_dependency(dependency);
+                    let previous_dependencies = self.dependencies.len();
+                    self.walk_expr(expr)?;
+                    self.collect_enclosing_creation(dependency, previous_dependencies, *named_args);
+                    return ControlFlow::Continue(());
                 }
             }
             ExprKind::Member(member_expr, ident) => {
@@ -537,23 +566,7 @@ impl<'gcx> Visit<'gcx> for BytecodeDependencyCollector<'gcx, '_> {
             // skipped.
             let previous_dependencies = self.dependencies.len();
             self.walk_expr(&stmt_try.expr)?;
-            let options_range =
-                named_args.map(|options| span_to_range(self.gcx.sess.source_map(), options.span));
-            let has_rewritten_option = options_range.is_some_and(|options_range| {
-                self.dependencies[previous_dependencies..].iter().any(|nested| {
-                    nested.loc.start < options_range.end && options_range.start < nested.loc.end
-                })
-            });
-            if has_rewritten_option {
-                // The outer replacement consumes its call options. Keep it native rather than
-                // emitting an overlapping update for a nested dynamic reference.
-                let force_native = self.force_native;
-                self.force_native = true;
-                self.collect_dependency(dependency);
-                self.force_native = force_native;
-            } else {
-                self.collect_dependency(dependency);
-            }
+            self.collect_enclosing_creation(dependency, previous_dependencies, *named_args);
 
             for clause in stmt_try.clauses {
                 for &var in clause.args {

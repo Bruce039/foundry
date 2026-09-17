@@ -387,22 +387,42 @@ contract Outer {
     uint256 public value;
     constructor(uint256 value_) { value = value_; }
 }
+contract Wrapper {
+    Outer public outer;
+    constructor(Outer outer_) { outer = outer_; }
+}
 "#,
     );
     prj.add_test(
         "NestedOption.t.sol",
         r#"
 import {Inner} from "../src/Inner.sol";
-import {Outer} from "../src/Outer.sol";
+import {Outer, Wrapper} from "../src/Outer.sol";
 contract NestedOptionTest {
-    function test_nested_option() public {
+    function predicted(uint256 value) internal view returns (address) {
         bytes32 salt = keccak256(type(Inner).creationCode);
-        bytes32 initCodeHash = keccak256(abi.encodePacked(type(Outer).creationCode, abi.encode(1)));
-        address predicted = address(uint160(uint256(keccak256(
+        bytes32 initCodeHash = keccak256(abi.encodePacked(type(Outer).creationCode, abi.encode(value)));
+        return address(uint160(uint256(keccak256(
             abi.encodePacked(bytes1(0xff), address(this), salt, initCodeHash)
         ))));
+    }
+
+    function test_nested_option() public {
         try new Outer{salt: keccak256(type(Inner).creationCode)}(1) returns (Outer outer) {
-            require(address(outer) == predicted, "wrong nested option rewrite");
+            require(address(outer) == predicted(1), "wrong nested option rewrite");
+        } catch { revert("deployment failed"); }
+    }
+
+    function test_ordinary_nested_option() public {
+        Outer outer = new Outer{salt: keccak256(type(Inner).creationCode)}(2);
+        require(address(outer) == predicted(2), "wrong ordinary nested option rewrite");
+    }
+
+    function test_nested_creation_with_option() public {
+        try new Wrapper(new Outer{salt: keccak256(type(Inner).creationCode)}(3))
+            returns (Wrapper wrapper)
+        {
+            require(address(wrapper.outer()) == predicted(3), "wrong nested creation rewrite");
         } catch { revert("deployment failed"); }
     }
 }
