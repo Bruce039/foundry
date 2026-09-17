@@ -309,6 +309,41 @@ contract FreeTest {
 "#]]);
 });
 
+forgetest!(preprocess_imported_free_function_external_dependency, |prj, cmd| {
+    prj.update_config(|config| config.dynamic_test_linking = true);
+    let external = r#"
+contract Impl {
+    function v() external pure returns (uint256) { return 111; }
+}
+"#;
+    prj.create_file("lib/dep/Impl.sol", external);
+    prj.add_source(
+        "Factory.sol",
+        r#"
+import {Impl} from "../lib/dep/Impl.sol";
+function makeImpl() returns (Impl) { return new Impl(); }
+"#,
+    );
+    prj.add_test(
+        "Free.t.sol",
+        r#"
+import {makeImpl} from "../src/Factory.sol";
+contract FreeTest {
+    function test_free() public {
+        require(makeImpl().v() == 111, "stale imported free function");
+    }
+}
+"#,
+    );
+    cmd.forge_fuse().arg("test").assert_success();
+    prj.create_file("lib/dep/Impl.sol", &external.replace("return 111", "return 222"));
+    cmd.forge_fuse().arg("test").assert_failure().stdout_eq(str![[r#"
+...
+[FAIL: stale imported free function] test_free() ([GAS])
+...
+"#]]);
+});
+
 forgetest!(preprocess_external_inheritance, |prj, cmd| {
     prj.update_config(|config| config.dynamic_test_linking = true);
     let external = r#"
@@ -335,6 +370,47 @@ contract InheritedTest is Impl {
 [FAIL: stale inherited implementation] test_inherited() ([GAS])
 ...
 "#]]);
+});
+
+forgetest!(preprocess_nested_try_call_option_dependency, |prj, cmd| {
+    prj.update_config(|config| config.dynamic_test_linking = true);
+    let inner = r#"
+contract Inner {
+    function v() external pure returns (uint256) { return 111; }
+}
+"#;
+    prj.add_source("Inner.sol", inner);
+    prj.add_source(
+        "Outer.sol",
+        r#"
+contract Outer {
+    uint256 public value;
+    constructor(uint256 value_) { value = value_; }
+}
+"#,
+    );
+    prj.add_test(
+        "NestedOption.t.sol",
+        r#"
+import {Inner} from "../src/Inner.sol";
+import {Outer} from "../src/Outer.sol";
+contract NestedOptionTest {
+    function test_nested_option() public {
+        bytes32 salt = keccak256(type(Inner).creationCode);
+        bytes32 initCodeHash = keccak256(abi.encodePacked(type(Outer).creationCode, abi.encode(1)));
+        address predicted = address(uint160(uint256(keccak256(
+            abi.encodePacked(bytes1(0xff), address(this), salt, initCodeHash)
+        ))));
+        try new Outer{salt: keccak256(type(Inner).creationCode)}(1) returns (Outer outer) {
+            require(address(outer) == predicted, "wrong nested option rewrite");
+        } catch { revert("deployment failed"); }
+    }
+}
+"#,
+    );
+    cmd.forge_fuse().arg("test").assert_success();
+    prj.add_source("Inner.sol", &inner.replace("return 111", "return 222"));
+    cmd.forge_fuse().arg("test").assert_success();
 });
 
 // Native classification is recomputed for an examined file instead of permanently suppressing

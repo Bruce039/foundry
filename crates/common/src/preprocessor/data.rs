@@ -46,12 +46,14 @@ impl ContractData {
         contract: &Contract<'_>,
         path: &Path,
         source: &solar::sema::hir::Source<'_>,
+        needs_constructor_helper: bool,
     ) -> Self {
         let artifact = format!("{}:{}", path.to_slash_lossy(), contract.name);
 
         // Process data for contracts with constructor and parameters.
         let constructor_data = contract
             .ctor
+            .filter(|_| needs_constructor_helper)
             .map(|ctor_id| gcx.hir.function(ctor_id))
             .filter(|ctor| !ctor.parameters.is_empty())
             .map(|ctor| {
@@ -168,6 +170,7 @@ function encodeArgs{contract_id}(DeployHelper{contract_id}.FoundryPpConstructorA
 pub(crate) fn collect_preprocessor_data(
     gcx: Gcx<'_>,
     referenced_contracts: &HashSet<ContractId>,
+    constructor_helpers: &HashSet<ContractId>,
     root_dir: &Path,
 ) -> PreprocessorData {
     let mut data = PreprocessorData::default();
@@ -181,7 +184,14 @@ pub(crate) fn collect_preprocessor_data(
 
         // Match the compiler input paths in generated imports and artifact references.
         let path = path.strip_prefix(root_dir).unwrap_or(path);
-        let contract_data = ContractData::new(gcx, *contract_id, contract, path, source);
+        let contract_data = ContractData::new(
+            gcx,
+            *contract_id,
+            contract,
+            path,
+            source,
+            constructor_helpers.contains(contract_id),
+        );
         data.insert(*contract_id, contract_data);
     }
     data

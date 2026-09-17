@@ -12,13 +12,13 @@ use path_slash::PathExt;
 use solar::sema::{
     Gcx, Hir,
     hir::{
-        CallArgs, CallOptions, ContractId, Expr, ExprKind, Function, FunctionKind, StateMutability,
-        Stmt, StmtKind, TypeKind, Visit,
+        CallArgs, CallOptions, ContractId, Expr, ExprKind, Function, FunctionKind, SourceId,
+        StateMutability, Stmt, StmtKind, TypeKind, Visit,
     },
     interface::{SourceMap, data_structures::Never, source_map::FileName},
 };
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     ops::{ControlFlow, Range},
     path::{Path, PathBuf},
 };
@@ -29,6 +29,8 @@ pub(crate) struct PreprocessorDependencies {
     pub preprocessed_contracts: BTreeMap<ContractId, Vec<BytecodeDependency>>,
     // Referenced contract ids.
     pub referenced_contracts: HashSet<ContractId>,
+    // Referenced contract ids that require generated constructor helpers.
+    pub constructor_helpers: HashSet<ContractId>,
 }
 
 impl PreprocessorDependencies {
@@ -74,11 +76,7 @@ impl PreprocessorDependencies {
                     FileName::Real(base_path)
                         if project_paths.is_source_file(base_path)
                             && (!base.is_abstract()
-                                || is_path_in_dir(
-                                    base_path,
-                                    &project_paths.sources,
-                                    root_dir,
-                                ))
+                                || is_path_in_dir(base_path, &project_paths.sources, root_dir))
                 )
             }) {
                 let mock_path = root_dir.join(path);
@@ -115,18 +113,17 @@ impl PreprocessorDependencies {
             let mut keep_native = deps_collector.has_native_dependency;
             deps_collector.dependencies.retain(|dependency| {
                 let dependency_id = dependency.referenced_contract;
-                let dependency = gcx.hir.contract(dependency_id);
-                let dependency_source = gcx.hir.source(dependency.source);
+                let referenced_contract = gcx.hir.contract(dependency_id);
+                let dependency_source = gcx.hir.source(referenced_contract.source);
                 let FileName::Real(dependency_path) = &dependency_source.file.name else {
                     keep_native = true;
                     return false;
                 };
-                let needs_constructor_helper = matches!(
-                    &dependency.kind,
-                    BytecodeDependencyKind::New { .. }
-                ) && dependency
-                    .ctor
-                    .is_some_and(|ctor_id| !gcx.hir.function(ctor_id).parameters.is_empty());
+                let needs_constructor_helper =
+                    matches!(&dependency.kind, BytecodeDependencyKind::New { .. })
+                        && referenced_contract.ctor.is_some_and(|ctor_id| {
+                            !gcx.hir.function(ctor_id).parameters.is_empty()
+                        });
                 let can_rewrite = can_rewrite(
                     dependency_path,
                     path,
@@ -150,31 +147,49 @@ impl PreprocessorDependencies {
         }
 
         // Source-unit free functions are compiled into their callers, but do not have a contract
-        // that can own generated helpers. Keep their bytecode references native and register the
-        // containing file for full invalidation.
+        // that can own generated helpers. Find every source containing a native bytecode reference,
+        // then propagate that classification through the reverse import graph to test/script
+        // callers.
+        let mut native_free_function_sources = HashSet::new();
+        let mut reverse_imports = HashMap::<SourceId, Vec<SourceId>>::new();
         for source_id in gcx.hir.source_ids() {
             let source = gcx.hir.source(source_id);
-            let FileName::Real(path) = &source.file.name else {
-                continue;
-            };
-            if !paths.contains(path) {
-                continue;
+            for &(_, imported_source_id) in source.imports {
+                reverse_imports.entry(imported_source_id).or_default().push(source_id);
             }
 
-            let full_path = root_dir.join(path);
-            candidate_files.insert(full_path.clone());
             let mut deps_collector = BytecodeDependencyCollector::new(
                 gcx,
                 source.file.src.as_str(),
                 project_paths,
-                script_paths.contains(path),
+                false,
                 true,
             );
             for function_id in source.items.iter().filter_map(|item| item.as_function()) {
                 let _ = deps_collector.visit_nested_function(function_id);
             }
             if deps_collector.has_native_dependency {
-                trace!("{} has a native source-unit dependency", path.display());
+                native_free_function_sources.insert(source_id);
+            }
+        }
+        let mut queue = native_free_function_sources.iter().copied().collect::<VecDeque<_>>();
+        while let Some(source_id) = queue.pop_front() {
+            if let Some(importers) = reverse_imports.get(&source_id) {
+                for &importer in importers {
+                    if native_free_function_sources.insert(importer) {
+                        queue.push_back(importer);
+                    }
+                }
+            }
+        }
+        for source_id in native_free_function_sources {
+            let source = gcx.hir.source(source_id);
+            if let FileName::Real(path) = &source.file.name
+                && paths.contains(path)
+            {
+                let full_path = root_dir.join(path);
+                candidate_files.insert(full_path.clone());
+                trace!("{} imports a native source-unit dependency", path.display());
                 current_mocks.insert(full_path);
             }
         }
@@ -186,11 +201,23 @@ impl PreprocessorDependencies {
         }
         mocks.extend(current_mocks);
 
+        let mut constructor_helpers = HashSet::new();
         for dependencies in preprocessed_contracts.values() {
-            referenced_contracts.extend(dependencies.iter().map(|dep| dep.referenced_contract));
+            for dependency in dependencies {
+                referenced_contracts.insert(dependency.referenced_contract);
+                if matches!(&dependency.kind, BytecodeDependencyKind::New { .. })
+                    && gcx
+                        .hir
+                        .contract(dependency.referenced_contract)
+                        .ctor
+                        .is_some_and(|ctor_id| !gcx.hir.function(ctor_id).parameters.is_empty())
+                {
+                    constructor_helpers.insert(dependency.referenced_contract);
+                }
+            }
         }
 
-        Self { preprocessed_contracts, referenced_contracts }
+        Self { preprocessed_contracts, referenced_contracts, constructor_helpers }
     }
 }
 
@@ -326,12 +353,12 @@ impl<'gcx, 'src> BytecodeDependencyCollector<'gcx, 'src> {
         let needs_constructor_helper =
             matches!(&dependency.kind, BytecodeDependencyKind::New { .. })
                 && contract.ctor.is_some_and(|ctor_id| {
-                self.gcx.hir.function(ctor_id).parameters.iter().any(|param_id| {
-                    !constructor_type_is_identity_independent(
-                        &self.gcx.hir.variable(*param_id).ty.kind,
-                    )
-                })
-            });
+                    self.gcx.hir.function(ctor_id).parameters.iter().any(|param_id| {
+                        !constructor_type_is_identity_independent(
+                            &self.gcx.hir.variable(*param_id).ty.kind,
+                        )
+                    })
+                });
         if needs_constructor_helper {
             self.has_native_dependency = true;
             trace!("skip dependency with identity-sensitive constructor arguments");
@@ -504,12 +531,29 @@ impl<'gcx> Visit<'gcx> for BytecodeDependencyCollector<'gcx, '_> {
             if let BytecodeDependencyKind::New { try_stmt, .. } = &mut dependency.kind {
                 *try_stmt = Some(has_custom_return);
             }
-            self.collect_dependency(dependency);
 
             // The special try/catch rewrite handles the outer creation itself. Walk its children
             // explicitly so bytecode references in constructor arguments and call options are not
             // skipped.
+            let previous_dependencies = self.dependencies.len();
             self.walk_expr(&stmt_try.expr)?;
+            let options_range =
+                named_args.map(|options| span_to_range(self.gcx.sess.source_map(), options.span));
+            let has_rewritten_option = options_range.is_some_and(|options_range| {
+                self.dependencies[previous_dependencies..].iter().any(|nested| {
+                    nested.loc.start < options_range.end && options_range.start < nested.loc.end
+                })
+            });
+            if has_rewritten_option {
+                // The outer replacement consumes its call options. Keep it native rather than
+                // emitting an overlapping update for a nested dynamic reference.
+                let force_native = self.force_native;
+                self.force_native = true;
+                self.collect_dependency(dependency);
+                self.force_native = force_native;
+            } else {
+                self.collect_dependency(dependency);
+            }
 
             for clause in stmt_try.clauses {
                 for &var in clause.args {
