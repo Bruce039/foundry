@@ -643,6 +643,12 @@ fn get_artifact_source<'a, FEN: FoundryEvmNetwork>(
     if let Some(artifacts) =
         state.config.available_artifacts.as_ref().or(state.config.artifact_lookup.as_ref())
     {
+        // Generated dynamic-linking references use exact compiler source-unit paths. Prefer an
+        // exact path whenever one exists so adding an unrelated artifact with the same suffix
+        // cannot make an already-cached reference ambiguous.
+        let has_exact_file_match = file.as_ref().is_some_and(|path| {
+            artifacts.iter().any(|(id, _)| id.source.as_path() == path.as_path())
+        });
         let ambiguous_file_profile =
             file.is_some() && version.is_none() && profile.is_none() && contract_name.is_some();
         let filter_artifacts = |treat_ambiguous_as_profile: bool| -> Vec<_> {
@@ -653,7 +659,11 @@ fn get_artifact_source<'a, FEN: FoundryEvmNetwork>(
                     let id_name = id.name.split('.').next().unwrap();
 
                     if let Some(path) = &file
-                        && !id.source.ends_with(path)
+                        && if has_exact_file_match {
+                            id.source.as_path() != path.as_path()
+                        } else {
+                            !id.source.ends_with(path)
+                        }
                     {
                         return false;
                     }
@@ -1448,8 +1458,8 @@ mod tests {
         let root_bytecode = Bytes::from_static(&[0x60, 0x01]);
         let library_bytecode = Bytes::from_static(&[0x60, 0x02]);
         let artifacts = ContractsByArtifact::new([
-            test_artifact("src/Thing.sol", "RootThing", "default", root_bytecode.clone()),
-            test_artifact("lib/src/Thing.sol", "LibThing", "default", library_bytecode),
+            test_artifact("src/Thing.sol", "Thing", "default", root_bytecode.clone()),
+            test_artifact("lib/src/Thing.sol", "Thing", "default", library_bytecode),
         ]);
         let temp = TempDir::new().unwrap();
         let library = temp.path().join("lib");
@@ -1467,7 +1477,7 @@ mod tests {
         };
         let cheats: Cheatcodes = Cheatcodes::new(Arc::new(config));
 
-        let resolved = super::get_artifact_code(&cheats, "src/Thing.sol:RootThing", false).unwrap();
+        let resolved = super::get_artifact_code(&cheats, "src/Thing.sol:Thing", false).unwrap();
 
         assert_eq!(resolved, root_bytecode);
     }

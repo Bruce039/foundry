@@ -37,11 +37,9 @@ impl PreprocessorDependencies {
         paths: &[PathBuf],
         script_paths: &HashSet<PathBuf>,
         project_paths: &ProjectPathsConfig<SolcLanguage>,
-        source_units: &[PathBuf],
+        source_units: &HashSet<PathBuf>,
         mocks: &mut HashSet<PathBuf>,
     ) -> Self {
-        let relative_paths = project_paths.paths_relative();
-        let src_dir = &relative_paths.sources;
         let root_dir = &project_paths.root;
         let remappings = &project_paths.remappings;
         let mut preprocessed_contracts = BTreeMap::new();
@@ -67,14 +65,20 @@ impl PreprocessorDependencies {
             })
         };
 
-        // Collect current mocks.
+        // Collect files whose inherited implementation remains natively linked.
         for (_, contract, _, path) in candidate_contracts() {
-            if contract.linearized_bases.iter().any(|base_id| {
+            if contract.linearized_bases.iter().skip(1).any(|base_id| {
                 let base = gcx.hir.contract(*base_id);
                 matches!(
                     &gcx.hir.source(base.source).file.name,
                     FileName::Real(base_path)
-                        if is_path_in_dir(base_path, src_dir, root_dir)
+                        if project_paths.is_source_file(base_path)
+                            && (!base.is_abstract()
+                                || is_path_in_dir(
+                                    base_path,
+                                    &project_paths.sources,
+                                    root_dir,
+                                ))
                 )
             }) {
                 let mock_path = root_dir.join(path);
@@ -83,15 +87,12 @@ impl PreprocessorDependencies {
             }
         }
 
-        // Collect dependencies for non-mock test/script contracts.
+        // Collect dependencies for test/script contracts. Native dependencies and safe dynamic
+        // rewrites are tracked independently so one native reference does not disable linking for
+        // the rest of the file.
         for (contract_id, contract, source, path) in candidate_contracts() {
             let full_path = root_dir.join(path);
             candidate_files.insert(full_path.clone());
-
-            if current_mocks.contains(&full_path) {
-                trace!("{} is a mock, skipping", path.display());
-                continue;
-            }
 
             // Treat the contract as a script when its file lives under the configured script
             // directory, or when it inherits from a `Script` base (forge-std). The inheritance
@@ -105,46 +106,76 @@ impl PreprocessorDependencies {
             let mut deps_collector = BytecodeDependencyCollector::new(
                 gcx,
                 source.file.src.as_str(),
-                src_dir,
-                root_dir,
+                project_paths,
                 is_script,
+                false,
             );
             // Analyze current contract.
             let _ = deps_collector.walk_contract(contract);
-            let keep_native = (!deps_collector.dependencies.is_empty()
-                && mocks.contains(&full_path))
-                || deps_collector.dependencies.iter().any(|dependency| {
-                    let dependency_id = dependency.referenced_contract;
-                    let dependency = gcx.hir.contract(dependency_id);
-                    let dependency_source = gcx.hir.source(dependency.source);
-                    let FileName::Real(dependency_path) = &dependency_source.file.name else {
-                        return true;
-                    };
-                    let has_constructor_args = dependency
-                        .ctor
-                        .is_some_and(|ctor_id| !gcx.hir.function(ctor_id).parameters.is_empty());
-                    !can_rewrite(
-                        dependency_path,
-                        path,
-                        root_dir,
-                        source_units,
-                        remappings,
-                        has_constructor_args,
-                        dependency_id,
-                    )
-                });
+            let mut keep_native = deps_collector.has_native_dependency;
+            deps_collector.dependencies.retain(|dependency| {
+                let dependency_id = dependency.referenced_contract;
+                let dependency = gcx.hir.contract(dependency_id);
+                let dependency_source = gcx.hir.source(dependency.source);
+                let FileName::Real(dependency_path) = &dependency_source.file.name else {
+                    keep_native = true;
+                    return false;
+                };
+                let needs_constructor_helper = matches!(
+                    &dependency.kind,
+                    BytecodeDependencyKind::New { .. }
+                ) && dependency
+                    .ctor
+                    .is_some_and(|ctor_id| !gcx.hir.function(ctor_id).parameters.is_empty());
+                let can_rewrite = can_rewrite(
+                    dependency_path,
+                    path,
+                    root_dir,
+                    source_units,
+                    remappings,
+                    needs_constructor_helper,
+                    dependency_id,
+                );
+                keep_native |= !can_rewrite;
+                can_rewrite
+            });
             if keep_native {
                 trace!("{} has an unsafe bytecode dependency, keeping it native", path.display());
                 current_mocks.insert(full_path.clone());
-                preprocessed_contracts.retain(|contract_id, _| {
-                    let source = gcx.hir.source(gcx.hir.contract(*contract_id).source);
-                    !matches!(&source.file.name, FileName::Real(path) if root_dir.join(path) == full_path)
-                });
-                continue;
             }
             // Ignore empty test contracts declared in source files with other contracts.
             if !deps_collector.dependencies.is_empty() {
                 preprocessed_contracts.insert(contract_id, deps_collector.dependencies);
+            }
+        }
+
+        // Source-unit free functions are compiled into their callers, but do not have a contract
+        // that can own generated helpers. Keep their bytecode references native and register the
+        // containing file for full invalidation.
+        for source_id in gcx.hir.source_ids() {
+            let source = gcx.hir.source(source_id);
+            let FileName::Real(path) = &source.file.name else {
+                continue;
+            };
+            if !paths.contains(path) {
+                continue;
+            }
+
+            let full_path = root_dir.join(path);
+            candidate_files.insert(full_path.clone());
+            let mut deps_collector = BytecodeDependencyCollector::new(
+                gcx,
+                source.file.src.as_str(),
+                project_paths,
+                script_paths.contains(path),
+                true,
+            );
+            for function_id in source.items.iter().filter_map(|item| item.as_function()) {
+                let _ = deps_collector.visit_nested_function(function_id);
+            }
+            if deps_collector.has_native_dependency {
+                trace!("{} has a native source-unit dependency", path.display());
+                current_mocks.insert(full_path);
             }
         }
 
@@ -202,10 +233,8 @@ struct BytecodeDependencyCollector<'gcx, 'src> {
     gcx: Gcx<'gcx>,
     /// Source content of current contract.
     src: &'src str,
-    /// Project source dir, used to determine if referenced contract is a source contract.
-    src_dir: &'src Path,
-    /// Project root, used to compare relative and absolute source paths.
-    root_dir: &'src Path,
+    /// Project paths, used to distinguish rewritten sources from native dependencies.
+    project_paths: &'src ProjectPathsConfig<SolcLanguage>,
     /// Whether the contract being analyzed lives in a script file.
     /// Script bytecode references must not be rewritten: native script CREATE/CREATE2 frames
     /// are handled by the script execution inspector, and `type(Contract).creationCode` must keep
@@ -213,6 +242,10 @@ struct BytecodeDependencyCollector<'gcx, 'src> {
     is_script: bool,
     /// Whether `type(Contract).creationCode` should keep native Solidity semantics.
     preserve_native_creation_code: bool,
+    /// Whether every dependency collected by this visitor must remain native.
+    force_native: bool,
+    /// Whether a source dependency remains natively linked.
+    has_native_dependency: bool,
     /// Dependencies collected for current contract.
     dependencies: Vec<BytecodeDependency>,
 }
@@ -221,27 +254,49 @@ impl<'gcx, 'src> BytecodeDependencyCollector<'gcx, 'src> {
     const fn new(
         gcx: Gcx<'gcx>,
         src: &'src str,
-        src_dir: &'src Path,
-        root_dir: &'src Path,
+        project_paths: &'src ProjectPathsConfig<SolcLanguage>,
         is_script: bool,
+        force_native: bool,
     ) -> Self {
         Self {
             gcx,
             src,
-            src_dir,
-            root_dir,
+            project_paths,
             is_script,
             preserve_native_creation_code: false,
+            force_native,
+            has_native_dependency: false,
             dependencies: vec![],
         }
     }
 
     /// Collects reference identified as bytecode dependency of analyzed contract.
-    /// Discards any reference that is not in project src directory (e.g. external
-    /// libraries or mock contracts that extend source contracts).
+    /// Rewrites source dependencies when semantics and artifact identity permit it, and tracks
+    /// every reference that must remain native so body-only changes invalidate its importer.
     fn collect_dependency(&mut self, dependency: BytecodeDependency) {
+        let contract = self.gcx.hir.contract(dependency.referenced_contract);
+        let source = self.gcx.hir.source(contract.source);
+        let FileName::Real(path) = &source.file.name else {
+            return;
+        };
+
+        // Test/script dependencies already receive full transitive invalidation from the cache.
+        // They are not eligible for dynamic linking because they are not ordinary source
+        // artifacts.
+        if !self.project_paths.is_source_file(path) {
+            trace!("skip test/script dependency {}", path.display());
+            return;
+        }
+
+        if self.force_native {
+            self.has_native_dependency = true;
+            trace!("keep dependency {} native", path.display());
+            return;
+        }
+
         // Script bytecode references must not be rewritten. See field doc on `is_script`.
         if self.is_script {
+            self.has_native_dependency = true;
             match &dependency.kind {
                 BytecodeDependencyKind::CreationCode => {
                     trace!("skip creationCode in script");
@@ -259,36 +314,55 @@ impl<'gcx, 'src> BytecodeDependencyCollector<'gcx, 'src> {
         if self.preserve_native_creation_code
             && matches!(&dependency.kind, BytecodeDependencyKind::CreationCode)
         {
+            self.has_native_dependency = true;
             trace!("skip creationCode in native creationCode context");
             return;
         }
 
-        let contract = self.gcx.hir.contract(dependency.referenced_contract);
-        let has_constructor_args = contract
-            .ctor
-            .is_some_and(|ctor_id| !self.gcx.hir.function(ctor_id).parameters.is_empty());
+        // Constructor helpers redeclare the parameter fields in a generated source unit. Custom
+        // types are nominally tied to their source-unit identity, which can differ when the test
+        // reached the target through a remapping or alias. Keep these deployments native rather
+        // than risk accepting a different type with the same printed name.
+        let needs_constructor_helper =
+            matches!(&dependency.kind, BytecodeDependencyKind::New { .. })
+                && contract.ctor.is_some_and(|ctor_id| {
+                self.gcx.hir.function(ctor_id).parameters.iter().any(|param_id| {
+                    !constructor_type_is_identity_independent(
+                        &self.gcx.hir.variable(*param_id).ty.kind,
+                    )
+                })
+            });
+        if needs_constructor_helper {
+            self.has_native_dependency = true;
+            trace!("skip dependency with identity-sensitive constructor arguments");
+            return;
+        }
         // Solidity only permits a custom layout on the most-derived contract, so the generated
         // constructor helper cannot inherit a target that declares one; keep this dependency
         // native.
-        if contract.layout.is_some() && has_constructor_args {
+        if contract.layout.is_some()
+            && matches!(&dependency.kind, BytecodeDependencyKind::New { .. })
+            && contract
+                .ctor
+                .is_some_and(|ctor_id| !self.gcx.hir.function(ctor_id).parameters.is_empty())
+        {
+            self.has_native_dependency = true;
             trace!("skip dependency on custom-layout contract");
             return;
         }
 
-        let source = self.gcx.hir.source(contract.source);
-        let FileName::Real(path) = &source.file.name else {
-            return;
-        };
-
-        // Remapped imports can have absolute or symlinked paths, while compiler input paths are
-        // relative and configured source directories can be canonicalized.
-        if !is_path_in_dir(path, self.src_dir, self.root_dir) {
-            let path = path.display();
-            trace!("ignore dependency {path}");
-            return;
-        }
-
         self.dependencies.push(dependency);
+    }
+}
+
+/// Returns whether copying a constructor type into a generated source unit preserves its identity.
+fn constructor_type_is_identity_independent(ty: &TypeKind<'_>) -> bool {
+    match ty {
+        TypeKind::Elementary(_) => true,
+        TypeKind::Array(array) => constructor_type_is_identity_independent(&array.element.kind),
+        TypeKind::Function(_) | TypeKind::Mapping(_) | TypeKind::Custom(_) | TypeKind::Err(_) => {
+            false
+        }
     }
 }
 
@@ -297,16 +371,13 @@ fn can_rewrite(
     path: &Path,
     source_path: &Path,
     root_dir: &Path,
-    source_units: &[PathBuf],
+    source_units: &HashSet<PathBuf>,
     remappings: &[Remapping],
-    has_constructor_args: bool,
+    needs_constructor_helper: bool,
     contract_id: ContractId,
 ) -> bool {
     let generated_path = path.strip_prefix(root_dir).unwrap_or(path);
-    if !source_units.iter().any(|source_unit| source_unit == generated_path)
-        || source_units.iter().filter(|source_unit| source_unit.ends_with(generated_path)).count()
-            != 1
-    {
+    if !source_units.contains(generated_path) {
         return false;
     }
 
@@ -317,7 +388,7 @@ fn can_rewrite(
         return false;
     }
 
-    if !has_constructor_args {
+    if !needs_constructor_helper {
         return true;
     }
 
@@ -434,6 +505,11 @@ impl<'gcx> Visit<'gcx> for BytecodeDependencyCollector<'gcx, '_> {
                 *try_stmt = Some(has_custom_return);
             }
             self.collect_dependency(dependency);
+
+            // The special try/catch rewrite handles the outer creation itself. Walk its children
+            // explicitly so bytecode references in constructor arguments and call options are not
+            // skipped.
+            self.walk_expr(&stmt_try.expr)?;
 
             for clause in stmt_try.clauses {
                 for &var in clause.args {

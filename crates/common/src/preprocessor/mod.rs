@@ -2,15 +2,14 @@ use crate::errors::convert_solar_errors;
 use foundry_compilers::{
     Compiler, ProjectPathsConfig, SourceParser, apply_updates,
     artifacts::SolcLanguage,
-    cache::CompilerCache,
     error::Result,
-    multi::{MultiCompiler, MultiCompilerInput, MultiCompilerLanguage, MultiCompilerSettings},
+    multi::{MultiCompiler, MultiCompilerInput, MultiCompilerLanguage},
     project::Preprocessor,
-    solc::{SolcCompiler, SolcSettings, SolcVersionedInput},
+    solc::{SolcCompiler, SolcVersionedInput},
 };
 use solar::parse::{ast::Span, interface::SourceMap};
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     ops::{ControlFlow, Range},
     path::PathBuf,
 };
@@ -29,6 +28,13 @@ use deps::{PreprocessorDependencies, remove_bytecode_dependencies};
 /// See <https://github.com/foundry-rs/foundry/pull/10010>.
 #[derive(Debug)]
 pub struct DynamicTestLinkingPreprocessor;
+
+/// Minimal cache representation used to recover source-unit identities without deserializing
+/// artifact metadata, import sets, compiler settings, or build records.
+#[derive(serde::Deserialize)]
+struct CompilerCacheFiles {
+    files: BTreeMap<PathBuf, serde::de::IgnoredAny>,
+}
 
 impl Preprocessor<SolcCompiler> for DynamicTestLinkingPreprocessor {
     #[instrument(name = "DynamicTestLinkingPreprocessor::preprocess", skip_all)]
@@ -76,17 +82,11 @@ impl Preprocessor<SolcCompiler> for DynamicTestLinkingPreprocessor {
             pcx.parse();
             let ControlFlow::Continue(()) = compiler.lower_asts()? else { return Ok(()) };
             let gcx = compiler.gcx();
-            let mut source_units = sources.keys().cloned().collect::<Vec<_>>();
-            // Cache data is optional, including on the first compilation. Avoid the cache
-            // reader diagnostics when probing for either supported settings format.
+            let mut source_units = sources.keys().cloned().collect::<HashSet<_>>();
+            // Cache data is optional, including on the first compilation. Deserialize only file
+            // keys: source-unit identity does not depend on cached artifacts or settings.
             let cache_files = crate::fs::read_to_string(&paths.cache).ok().and_then(|cache| {
-                serde_json::from_str::<CompilerCache<MultiCompilerSettings>>(&cache)
-                    .map(|cache| cache.files)
-                    .or_else(|_| {
-                        serde_json::from_str::<CompilerCache<SolcSettings>>(&cache)
-                            .map(|cache| cache.files)
-                    })
-                    .ok()
+                serde_json::from_str::<CompilerCacheFiles>(&cache).ok().map(|cache| cache.files)
             });
             if let Some(files) = cache_files {
                 source_units.extend(
@@ -95,8 +95,6 @@ impl Preprocessor<SolcCompiler> for DynamicTestLinkingPreprocessor {
                         .map(|path| path.strip_prefix(&paths.root).unwrap_or(&path).to_path_buf()),
                 );
             }
-            source_units.sort_unstable();
-            source_units.dedup();
             // Collect tests and scripts dependencies and identify mock contracts.
             // Script paths are passed separately so salted new-expressions are left untouched
             // (Foundry's broadcast redirects native CREATE2 through the deterministic factory,
